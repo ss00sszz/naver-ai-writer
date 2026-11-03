@@ -217,6 +217,8 @@ if fetch_clicked:
     tasks = []
     for i, (url, title, body) in enumerate(url_inputs):
         st.session_state.slots[i] = {"article": None, "analysis": None, "drafts": [], "error": ""}
+        for widget_key in (f"chosen_{i}", f"edited_title_{i}", f"keywords_{i}"):
+            st.session_state.pop(widget_key, None)
         if body.strip():
             st.session_state.slots[i]["article"] = {"url": url, "title": title or f"글 {i+1}", "body": body.strip(), "source": "직접 입력"}
         elif url.strip():
@@ -250,8 +252,11 @@ if analyze_clicked:
                     for f in concurrent.futures.as_completed(futures):
                         i = futures[f]
                         try:
-                            st.session_state.slots[i]["analysis"] = f.result()
+                            new_analysis = f.result()
+                            st.session_state.slots[i]["analysis"] = new_analysis
                             st.session_state.slots[i]["error"] = ""
+                            for widget_key in (f"chosen_{i}", f"edited_title_{i}", f"keywords_{i}"):
+                                st.session_state.pop(widget_key, None)
                         except Exception as ex:
                             st.session_state.slots[i]["error"] = "분석 오류: " + str(ex)
             st.success("분석 요청이 끝났습니다.")
@@ -274,7 +279,25 @@ for i, slot in enumerate(st.session_state.slots):
             for j, t in enumerate(options):
                 st.write(f"{j+1}. {t}")
             if options:
-                st.selectbox("원고에 사용할 제목", options, key=f"chosen_{i}")
+                # 제목 선택 시에만 편집란을 덮어씁니다. 그 외 재실행에서는 수정 내용을 유지합니다.
+                chosen_key = f"chosen_{i}"
+                edited_key = f"edited_title_{i}"
+                if chosen_key not in st.session_state or st.session_state[chosen_key] not in options:
+                    st.session_state[chosen_key] = options[0]
+                if edited_key not in st.session_state:
+                    st.session_state[edited_key] = st.session_state[chosen_key]
+
+                def apply_selected_title(selection_key=chosen_key, target_key=edited_key):
+                    st.session_state[target_key] = st.session_state[selection_key]
+
+                st.selectbox("원고에 사용할 제목", options, key=chosen_key, on_change=apply_selected_title)
+                st.text_area(
+                    "원고 제목 직접 수정 (선택)",
+                    key=edited_key,
+                    height=90,
+                    help="추천 제목을 선택하면 자동 입력됩니다. 수정할 경우 Ctrl+Enter로 입력을 확정하세요. 수정하지 않으면 선택한 추천 제목으로 작성합니다.",
+                )
+                st.caption("제목을 수정하지 않아도 됩니다. 수정한 경우 원고 생성 시 해당 제목이 적용됩니다.")
             st.caption("제목에서 포착한 핵심 개념: " + ", ".join(analysis.get("title_terms", [])))
             st.text_area("핵심키워드 수정 (한 줄에 하나)", value="\n".join(analysis["keywords"]), height=220, key=f"keywords_{i}")
             ev = analysis.get("evidence", [])
@@ -297,7 +320,7 @@ if st.button("③ 분석된 글 모두 원고 생성", type="primary", use_conta
                 continue
             analysis = dict(slot["analysis"])
             analysis["keywords"] = [x.strip() for x in st.session_state.get(f"keywords_{i}", "").splitlines() if x.strip()]
-            title = st.session_state.get(f"chosen_{i}") or slot["article"]["title"]
+            title = (st.session_state.get(f"edited_title_{i}") or "").strip() or st.session_state.get(f"chosen_{i}") or slot["article"]["title"]
             slot["drafts"] = []
             for n in range(int(num_drafts)):
                 tasks.append((i, n + 1, slot["article"], analysis, title))
