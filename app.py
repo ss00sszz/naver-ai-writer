@@ -236,10 +236,15 @@ def write_article(api_key, model, effort, article, analysis, main_keyword, custo
 
 
 
+MAX_ARTICLES = 10  # 입력 및 분석 가능한 글 수
+
 st.title("✍️ 네이버 AI 원고 스튜디오")
-st.caption("공개 블로그/카페 글 최대 5개 → 제목 추천 → 문맥형 핵심키워드 → 프롬프트 기반 원고 생성")
+st.caption("공개 블로그/카페 글 최대 10개 → 제목 추천 → 문맥형 핵심키워드 → 프롬프트 기반 원고 생성")
 if "slots" not in st.session_state:
-    st.session_state.slots = [{"article": None, "analysis": None, "drafts": [], "error": ""} for _ in range(5)]
+    st.session_state.slots = []
+# 업데이트 이전 5개 글 세션도 유지하면서 10개로 확장합니다.
+while len(st.session_state.slots) < MAX_ARTICLES:
+    st.session_state.slots.append({"article": None, "analysis": None, "drafts": [], "error": ""})
 
 with st.sidebar:
     st.header("API · 모델 설정")
@@ -258,9 +263,9 @@ with st.sidebar:
 
 main_keyword = st.text_input("메인키워드 (전체 작업 공통)", placeholder="예: 아파트추가담보대출")
 count = st.slider("링크별 추천 제목 수", 5, 15, 10)
-st.subheader("1. 링크 5개 입력 / 원문 직접 붙여넣기")
+st.subheader("1. 링크 10개 입력 / 원문 직접 붙여넣기")
 url_inputs = []
-for i in range(5):
+for i in range(MAX_ARTICLES):
     with st.expander(f"글 {i+1}", expanded=(i == 0)):
         url = st.text_input(f"네이버 글 URL #{i+1}", key=f"url{i}", placeholder="https://m.blog.naver.com/... 또는 https://cafe.naver.com/...")
         manual_title = st.text_input(f"직접 입력 제목 #{i+1} (선택)", key=f"title{i}")
@@ -269,9 +274,9 @@ for i in range(5):
 
 c1, c2 = st.columns(2)
 with c1:
-    fetch_clicked = st.button("① 5개 글 가져오기", type="primary", use_container_width=True)
+    fetch_clicked = st.button("① 최대 10개 글 가져오기", type="primary", use_container_width=True)
 with c2:
-    analyze_clicked = st.button("② 5개 글 AI 분석", use_container_width=True)
+    analyze_clicked = st.button("② 최대 10개 글 AI 분석", use_container_width=True)
 
 if fetch_clicked:
     tasks = []
