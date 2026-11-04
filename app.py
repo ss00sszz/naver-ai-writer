@@ -162,6 +162,37 @@ evidence의 sentence에는 본문에 있는 짧은 근거 문장을 정확히 �
     return data
 
 
+def keyword_lines(value):
+    """편집기 입력을 순서 유지하면서 중복 제거합니다."""
+    return list(dict.fromkeys(line.strip() for line in value.splitlines() if line.strip()))
+
+
+def keyword_exclusions(original, selected):
+    selected_normalized = {re.sub(r"\s+", "", x).casefold() for x in selected}
+    return [word for word in original if re.sub(r"\s+", "", word).casefold() not in selected_normalized]
+
+
+def keyword_occurrences(text, excluded):
+    """띄어쓰기 차이까지 고려해 제외된 구절이 나타나는지 검사합니다."""
+    normalized_text = re.sub(r"\s+", "", text).casefold()
+    return [word for word in excluded if re.sub(r"\s+", "", word).casefold() in normalized_text]
+
+
+def strip_excluded_references(text, excluded):
+    """구조/원문 참고자료가 삭제된 키워드를 다시 유도하지 않도록 제거합니다."""
+    for phrase in sorted(excluded, key=len, reverse=True):
+        if not phrase.strip():
+            continue
+        pattern = r"\s*".join(re.escape(piece) for piece in phrase.split())
+        text = re.sub(pattern, "", text, flags=re.IGNORECASE)
+    return text
+
+
+def commit_keywords(i):
+    slot = st.session_state.slots[i]
+    slot["saved_keywords"] = keyword_lines(st.session_state.get(f"keywords_{i}", ""))
+
+
 def write_article(api_key, model, effort, article, analysis, main_keyword, custom_prompt, title, index, use_source):
     client = OpenAI(api_key=api_key, timeout=150, max_retries=1)
     instructions = """당신은 한국어 전문 원고 편집자입니다. 사용자의 맞춤 작성 지침을 우선하여 독립적인 새 글을 만드세요.
@@ -170,10 +201,39 @@ def write_article(api_key, model, effort, article, analysis, main_keyword, custo
 금융 주제는 정확하지 않은 조건·금리·승인·법규를 단정하지 마세요. 확인되지 않은 사실은 조건이 달라질 수 있다고 표현하세요.
 작성 지침의 분량, 말투, 키워드 사용 횟수, 제목, 구조를 가능한 충실히 지키세요.
 원고 본문만 출력하세요."""
-    payload = {"selected_title": title, "main_keyword": main_keyword, "keywords": analysis["keywords"], "structure_reference": analysis["structure"], "custom_prompt": custom_prompt, "draft_number": index, "variation_instruction": "앞서 작성한 글을 재사용하지 말고 이 차수에 고유한 구성과 전개 방식을 적용하세요."}
+    excluded = analysis.get("excluded_keywords", [])
+    payload = {
+        "selected_title": title,
+        "main_keyword": main_keyword,
+        "keywords_to_use": analysis["keywords"],
+        "keywords_never_to_include": excluded,
+        "structure_reference": strip_excluded_references(analysis["structure"], excluded),
+        "custom_prompt": custom_prompt,
+        "draft_number": index,
+        "variation_instruction": "앞서 작성한 글을 재사용하지 말고 이 차수에 고유한 구성과 전개 방식을 적용하세요.",
+        "keyword_priority": "keywords_to_use만 사용 키워드로 간주하세요. keywords_never_to_include는 원문에 있더라도 사용하지 마세요."
+    }
     if use_source:
-        payload["source_summary_reference"] = {"title": article["title"], "body": article["body"][:12000]}
-    return api_call(client, model, instructions, json.dumps(payload, ensure_ascii=False), effort=effort)
+        payload["source_summary_reference"] = {
+            "title": strip_excluded_references(article["title"], excluded),
+            "body": strip_excluded_references(article["body"][:12000], excluded),
+        }
+
+    request_text = json.dumps(payload, ensure_ascii=False)
+    if excluded:
+        instructions += "\n삭제한 키워드 목록은 사용 금지입니다. 띄어쓰기만 바꿔서 쓰는 것도 금지하며, 참고 원문이나 사용자 프롬프트보다 이 제외 조건을 우선하세요."
+    result = api_call(client, model, instructions, request_text, effort=effort)
+    # 자동 검사 후 문제가 있으면 1회 수정 요청합니다. 재시도에도 남으면 경고합니다.
+    found = keyword_occurrences(result, excluded)
+    if found:
+        retry_instructions = instructions + "\n원고에 금지 키워드가 섞이지 않도록 전체 글을 다시 작성하세요. 금지 표현을 한 번도 쓰지 마세요."
+        retry_payload = json.dumps({"previous_draft": result, "forbidden_matches": found, "keywords_to_use": analysis["keywords"], "selected_title": title, "custom_prompt": custom_prompt, "instruction": "원고 전체를 다시 작성하고 금지 구절을 완전히 제거하세요."}, ensure_ascii=False)
+        result = api_call(client, model, retry_instructions, retry_payload, effort=effort)
+        remaining = keyword_occurrences(result, excluded)
+        if remaining:
+            return "⚠️ 제외한 키워드가 여전히 발견되어 확인이 필요합니다: " + ", ".join(remaining) + "\n\n" + result
+    return result
+
 
 
 st.title("✍️ 네이버 AI 원고 스튜디오")
@@ -219,6 +279,7 @@ if fetch_clicked:
         st.session_state.slots[i] = {"article": None, "analysis": None, "drafts": [], "error": ""}
         for widget_key in (f"chosen_{i}", f"edited_title_{i}", f"keywords_{i}"):
             st.session_state.pop(widget_key, None)
+        st.session_state.slots[i].pop("saved_keywords", None)
         if body.strip():
             st.session_state.slots[i]["article"] = {"url": url, "title": title or f"글 {i+1}", "body": body.strip(), "source": "직접 입력"}
         elif url.strip():
@@ -254,6 +315,7 @@ if analyze_clicked:
                         try:
                             new_analysis = f.result()
                             st.session_state.slots[i]["analysis"] = new_analysis
+                            st.session_state.slots[i]["saved_keywords"] = list(new_analysis["keywords"])
                             st.session_state.slots[i]["error"] = ""
                             for widget_key in (f"chosen_{i}", f"edited_title_{i}", f"keywords_{i}"):
                                 st.session_state.pop(widget_key, None)
@@ -299,7 +361,28 @@ for i, slot in enumerate(st.session_state.slots):
                 )
                 st.caption("제목을 수정하지 않아도 됩니다. 수정한 경우 원고 생성 시 해당 제목이 적용됩니다.")
             st.caption("제목에서 포착한 핵심 개념: " + ", ".join(analysis.get("title_terms", [])))
-            st.text_area("핵심키워드 수정 (한 줄에 하나)", value="\n".join(analysis["keywords"]), height=220, key=f"keywords_{i}")
+            if "saved_keywords" not in slot:
+                slot["saved_keywords"] = list(analysis["keywords"])
+            if f"keywords_{i}" not in st.session_state:
+                st.session_state[f"keywords_{i}"] = "\n".join(slot["saved_keywords"])
+            st.text_area(
+                "핵심키워드 수정 (한 줄에 하나)",
+                height=220,
+                key=f"keywords_{i}",
+                help="삭제 또는 추가한 후 아래 '키워드 수정 저장' 버튼을 누르세요. Ctrl+Enter로 입력을 확정해도 됩니다.",
+                on_change=commit_keywords,
+                args=(i,),
+            )
+            if st.button("💾 키워드 수정 저장", key=f"save_keywords_{i}"):
+                commit_keywords(i)
+                st.success("수정 키워드가 저장되었습니다. 생성 시 이 목록만 사용합니다.")
+            saved = slot["saved_keywords"]
+            removed = keyword_exclusions(analysis["keywords"], saved)
+            st.caption(f"저장된 키워드: {len(saved)}개 · 삭제하여 제외된 키워드: {len(removed)}개")
+            if removed:
+                st.info("원고에서 제외할 키워드: " + ", ".join(removed))
+            if keyword_lines(st.session_state.get(f"keywords_{i}", "")) != saved:
+                st.warning("편집 내용이 아직 저장되지 않았습니다. '키워드 수정 저장'을 클릭하세요.")
             ev = analysis.get("evidence", [])
             if ev:
                 with st.expander("본문 근거 문장 보기"):
@@ -319,8 +402,14 @@ if st.button("③ 분석된 글 모두 원고 생성", type="primary", use_conta
             if not slot["analysis"] or not slot["article"]:
                 continue
             analysis = dict(slot["analysis"])
-            analysis["keywords"] = [x.strip() for x in st.session_state.get(f"keywords_{i}", "").splitlines() if x.strip()]
+            # 편집 화면에 남은 문자가 있다면 마지막 확정값을 사용합니다.
+            selected = slot.get("saved_keywords", list(analysis["keywords"]))
+            analysis["keywords"] = list(selected)
+            analysis["excluded_keywords"] = keyword_exclusions(slot["analysis"]["keywords"], selected)
             title = (st.session_state.get(f"edited_title_{i}") or "").strip() or st.session_state.get(f"chosen_{i}") or slot["article"]["title"]
+            conflicts = keyword_occurrences(title + "\n" + main_keyword, analysis["excluded_keywords"])
+            if conflicts:
+                st.warning(f"글 {i+1}: 삭제한 키워드가 제목 또는 메인키워드에도 포함되어 있습니다: {', '.join(conflicts)}. 제목/메인키워드를 확인하세요.")
             slot["drafts"] = []
             for n in range(int(num_drafts)):
                 tasks.append((i, n + 1, slot["article"], analysis, title))
